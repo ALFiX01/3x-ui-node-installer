@@ -11,7 +11,7 @@
 
 ## Запуск с GitHub
 
-Подключитесь к VPS по SSH. 
+Подключитесь к VPS по SSH и выполните:
 
 ```bash
 apt-get update && apt-get install -y curl ca-certificates

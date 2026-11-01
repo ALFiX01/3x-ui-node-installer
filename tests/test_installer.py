@@ -14,6 +14,31 @@ BASH = shutil.which("bash") or r"C:\Program Files\Git\bin\bash.exe"
 
 
 class InstallerTests(unittest.TestCase):
+    def test_terminal_style_plain_output_and_error(self):
+        result = self.bash("begin_step 1 'Проверка VPS'; begin_step 2 'Пакеты'; ui_line 33 '[ ! ] Предупреждение'", env_extra={"TERM": "xterm"})
+        self.assertIn('[1/10] Проверка VPS', result.stdout)
+        self.assertIn('[ OK ] Проверка VPS', result.stdout)
+        self.assertIn('[2/10] Пакеты', result.stdout)
+        self.assertNotIn('\x1b', result.stdout)
+        result = self.bash("ui_line 32 '[ OK ] Готово'", env_extra={"NO_COLOR": "1"})
+        self.assertEqual(result.stdout.strip(), '[ OK ] Готово')
+        result = self.bash("begin_step 3 'Проверка DNS'; die 'DNS failure'", ok=False)
+        self.assertIn('[ОШИБКА] DNS failure', result.stderr)
+        self.assertIn('Проверка DNS', result.stderr)
+        self.assertNotIn('[ OK ] Проверка DNS', result.stdout)
+
+    def test_full_install_progress_and_plain_credentials(self):
+        self.fake_vps()
+        result = self.run_main()
+        for number in range(1, 11):
+            self.assertIn(f'[{number}/10]', result.stdout)
+        self.assertIn('Установка NEW-NODE завершена', result.stdout)
+        report = (self.work / 'machine/root/3xui-node-credentials.txt').read_text(encoding='utf-8')
+        self.assertNotIn('\x1b', report)
+        self.assertNotIn('/10]', report)
+        self.assertIn('Panel: https://', report)
+        self.assertIn('VLESS link:', report)
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(dir=ROOT)
         self.addCleanup(self.tmp.cleanup)

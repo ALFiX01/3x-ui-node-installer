@@ -4,11 +4,31 @@
 # Requires direct DNS (no CDN proxy) and inbound TCP 80, 443, 8443.
 set -Eeuo pipefail
 umask 077
-stage='preflight checks'
+stage='Проверка VPS'
+step_number=0
 diagnostic_service=''
 credentials_file=''
 state_fields=(panel cover email username password base private public short client_id
     install_started install_done configured token_started inbound_done completed)
+
+# Check the actual output stream: reports and redirected logs stay plain text.
+ui_line() {
+    local color=$1
+    shift
+    if [[ -t 1 && ${TERM:-dumb} != dumb && -z ${NO_COLOR+x} ]]; then
+        printf '\033[%sm%s\033[0m\n' "$color" "$*"
+    else
+        printf '%s\n' "$*"
+    fi
+}
+
+begin_step() {
+    if ((step_number > 0)); then ui_line 32 "  [ OK ] $stage"; fi
+    step_number=$1
+    stage=$2
+    printf '\n'
+    ui_line 36 "  [$step_number/10] $stage"
+}
 
 # JSON is data, never sourced as shell code. Replace the state atomically.
 save_state() {
@@ -89,12 +109,13 @@ on_error() {
     local status=$1 line=$2
     trap - ERR
     set +e
-    printf 'Installation stopped at line %s during %s (exit %s). Existing changes were not rolled back.\n' "$line" "$stage" "$status" >&2
+    ui_line 31 "  [СТОП] $stage" >&2
+    printf '  Строка %s, код выхода %s. Изменения на сервере не отменены.\n' "$line" "$status" >&2
     if [[ -n "${state_dir:-}" && -f "$state_dir/state.json" ]]; then
-        printf 'After resolving the error, run: bash install_3xui_node.sh --resume\n' >&2
+        printf '\n  После устранения причины продолжите установку:\n  bash install_3xui_node.sh --resume\n' >&2
     fi
     if [[ -n "$credentials_file" && -f "$credentials_file" ]]; then
-        printf 'Generated panel credentials are saved in %s (root only).\n' "$credentials_file" >&2
+        printf '\n  Данные панели: %s (доступ только root).\n' "$credentials_file" >&2
     fi
     if [[ -n "$diagnostic_service" ]] && command -v systemctl >/dev/null; then
         systemctl status "$diagnostic_service" --no-pager --full --lines=0 >&2
@@ -104,7 +125,7 @@ on_error() {
     fi
     exit "$status"
 }
-die() { printf 'ERROR: %s\n' "$*" >&2; on_error 1 "${BASH_LINENO[0]}"; }
+die() { ui_line 31 "  [ОШИБКА] $*" >&2; on_error 1 "${BASH_LINENO[0]}"; }
 trap 'on_error "$?" "$LINENO"' ERR
 
 # A successful reload may return before the new HTTPS listener is ready.
@@ -113,16 +134,17 @@ wait_for_http() {
     local label=$1 url=$2 attempt error_file
     shift 2
     error_file=$(mktemp)
-    printf 'Waiting for %s...\n' "$label"
+    ui_line 36 "  [ .. ] Ожидание: $label"
     for ((attempt=1; attempt<=30; attempt++)); do
         if curl -fsS --noproxy '*' --connect-timeout 2 --max-time 3 \
             "$@" "$url" -o /dev/null 2> "$error_file"; then
             rm -f -- "$error_file"
+            ui_line 32 "  [ OK ] $label отвечает"
             return 0
         fi
         if ((attempt < 30)); then sleep 1; fi
     done
-    printf '%s did not become ready after 30 attempts. Last curl error:\n' "$label" >&2
+    printf '%s: нет ответа после 30 попыток. Последняя ошибка curl:\n' "$label" >&2
     cat "$error_file" >&2
     rm -f -- "$error_file"
     return 1
@@ -298,12 +320,15 @@ ensure_node_token() {
 }
 
 print_details() {
-    printf '\n%s\n' '============================================================'
-    printf '%s\n' '                     ДАННЫЕ 3X-UI'
-    printf '%s\n\n' '============================================================'
-    printf '%s\n' '1. ВХОД В ПАНЕЛЬ'
+    printf '\n'
+    ui_line 36 '  --------------------------------------------------------'
+    ui_line 36 '  NEW-NODE / ДАННЫЕ ПОДКЛЮЧЕНИЯ'
+    ui_line 36 '  --------------------------------------------------------'
+    printf '\n'
+    ui_line 36 '1. ВХОД В ПАНЕЛЬ'
     printf 'Panel: https://%s/%s/\nUsername: %s\nPassword: %s\n' "$panel" "$base" "$username" "$password"
-    printf '\n%s\n' '2. ДОБАВЛЕНИЕ НОДЫ В ОСНОВНУЮ 3X-UI'
+    printf '\n'
+    ui_line 36 '2. ДОБАВЛЕНИЕ НОДЫ В ОСНОВНУЮ 3X-UI'
     printf '%s\n' 'Заполните эти поля в разделе «Ноды» основной панели:'
     printf 'Name: node-%s\nScheme: https\nAddress: %s\nPort: 443\nBasePath: /%s/\n' "$panel" "$panel" "$base"
     printf 'apiToken: %s\n' "$api_token"
@@ -311,14 +336,16 @@ print_details() {
     printf 'Panel API URL: https://%s/%s/panel/api/\n' "$panel" "$base"
     printf '%s\n' 'Адрес вводится без https:// и пути; BasePath — с / по краям.'
     printf '%s\n' 'Для связи между панелями используется порт 443. SSH, логин и пароль панели для API не нужны.'
-    printf '\n%s\n' '3. КЛИЕНТСКОЕ ПОДКЛЮЧЕНИЕ VLESS REALITY'
+    printf '\n'
+    ui_line 36 '3. КЛИЕНТСКОЕ ПОДКЛЮЧЕНИЕ VLESS REALITY'
     printf 'Server address: %s\nReality port: 8443\nProtocol: VLESS\nTransport: TCP\nSecurity: Reality\nFlow: xtls-rprx-vision\n' "$cover"
     printf 'SNI: %s\nTarget: %s:443\nFingerprint: firefox\n' "$cover" "$cover"
     printf 'UUID: %s\nPublic key: %s\nShort ID: %s\n' "$client_id" "$public" "$short"
     printf '\nVLESS link:\n%s\n' "$link"
-    printf '\n%s\n' '4. ПРОВЕРКИ И ХРАНЕНИЕ'
+    printf '\n'
+    ui_line 36 '4. ПРОВЕРКИ И ХРАНЕНИЕ'
     printf '%s\n' 'Параметры подключения и API проверены локально на VPS.'
-    printf '%s\n' 'Доступ с основной панели и работа реального VLESS-клиента требуют отдельной проверки.'
+    ui_line 33 '[ ! ] Доступ с основной панели и работа реального VLESS-клиента требуют отдельной проверки.'
     printf 'Saved to: %s (root only)\n' "$result"
 }
 
@@ -367,6 +394,23 @@ install_panel() {
     [[ -z "$(ss -H -ltn 'sport = :4772' | grep -v '127.0.0.1:4772')" ]] || die 'Unexpected public panel listener.'
 }
 
+print_banner() {
+    ui_line 36 '  --------------------------------------------------------'
+    cat <<'BANNER'
+
+ _   _ _____ __        __      _   _  ___  ____  _____
+| \ | | ____|\ \      / /     | \ | |/ _ \|  _ \| ____|
+|  \| |  _|   \ \ /\ / /______|  \| | | | | | | |  _|
+| |\  | |___   \ V  V /|______| |\  | |_| | |_| | |___
+|_| \_|_____|   \_/\_/        |_| \_|\___/|____/|_____|
+
+  Установка ноды 3x-ui / Ubuntu 22.04 и 24.04
+  Nginx / Let's Encrypt / VLESS Reality
+
+BANNER
+    ui_line 36 '  --------------------------------------------------------'
+}
+
 main() {
     local resume=0
     case "${1:-}" in
@@ -376,6 +420,8 @@ main() {
         *) die 'Unknown argument. Usage: bash install_3xui_node.sh [--resume]' ;;
     esac
     [[ $# -le 1 ]] || die 'Too many arguments.'
+    print_banner
+    begin_step 1 'Проверка VPS и параметров установки'
     require_host
     # Prevent concurrent installers, including a fresh run racing --resume.
     exec 9>/run/lock/3xui-node-install.lock
@@ -390,23 +436,26 @@ main() {
         [[ -f "$state_dir/state.json" && ! -L "$state_dir/state.json" ]] || die 'Missing or unsafe installation state file.'
         [[ $(stat -c '%u:%a' "$state_dir/state.json") == 0:600 ]] || die 'Installation state file must be owned by root with mode 600.'
         load_state
-        printf 'Resuming installation for %s and %s.\n' "$panel" "$cover"
+        ui_line 36 "  [ .. ] Продолжение установки: $panel / $cover"
+        printf '  Сохранённые параметры будут проверены повторно.\n'
     else
         [[ ! -e "$state_dir" && ! -L "$state_dir" ]] || die 'Installation state already exists. Use --resume.'
         [[ ! -e /usr/local/x-ui && ! -e /etc/x-ui/x-ui.db ]] || die 'Existing 3x-ui found. This script only supports a fresh VPS.'
         [[ ! -e /etc/nginx ]] || die 'Existing Nginx configuration found. Use a fresh VPS.'
         [[ ! -e "$result" && ! -L "$result" ]] || die 'Saved credentials already exist. Inspect the previous installation before continuing.'
-        printf 'Use two domains with DNS A records pointing directly to this VPS. Disable CDN proxy.\n'
-        read -r -p 'Panel domain: ' panel
-        read -r -p 'Camouflage domain (Reality SNI/Target): ' cover
+        printf '\n  Настройка ноды\n\n'
+        printf '  Укажите два разных домена без https://, порта и пути.\n'
+        printf '  A-записи должны указывать на VPS; CDN-прокси отключите.\n\n'
+        read -r -p '  Домен панели       > ' panel
+        read -r -p '  Домен маскировки   > ' cover
         panel=${panel,,}; cover=${cover,,}
         valid_domain "$panel" && valid_domain "$cover" || die 'Invalid domain. Use ASCII/punycode names without https:// or paths.'
         [[ "$panel" != "$cover" ]] || die 'The two domains must differ.'
-        read -r -p "Email for Let's Encrypt: " email
+        read -r -p '  Email сертификатов > ' email
         [[ "$email" == *@*.* && "$email" != -* && "$email" != *[[:space:]]* ]] || die 'Invalid email.'
     fi
     export DEBIAN_FRONTEND=noninteractive
-    stage='installing prerequisites'
+    begin_step 2 'Установка необходимых пакетов'
     apt-get update
     apt-get install -y ca-certificates curl dnsutils openssl python3 jq iproute2 util-linux
     local port
@@ -432,7 +481,7 @@ main() {
         chmod 600 "$result"
     fi
     credentials_file=$result
-    stage='checking DNS'
+    begin_step 3 'Проверка DNS'
     local ipv4 domain records address
     ipv4=$(curl -4fsS --retry 2 --connect-timeout 10 --max-time 20 https://api.ipify.org)
     python3 -c 'import ipaddress,sys; assert ipaddress.IPv4Address(sys.argv[1]).is_global' "$ipv4"
@@ -444,9 +493,10 @@ main() {
         done <<< "$records"
         # This installer deliberately serves IPv4 only. Do not leave broken AAAA.
         [[ -z "$(dig +short AAAA "$domain" | awk '/:/')" ]] || die "Remove AAAA records for $domain before using this IPv4 installer."
+        ui_line 32 "  [ OK ] $domain указывает на VPS $ipv4"
     done
-    printf 'DNS checks passed. Certificate issuance will check public HTTP access.\n'
-    stage='installing and configuring Nginx'
+    ui_line 36 '  [ .. ] Публичный HTTP-доступ будет проверен при выпуске сертификатов.'
+    begin_step 4 'Установка и настройка Nginx'
     diagnostic_service=nginx
     apt-get install -y nginx certbot fail2ban
     install -d -m 755 /var/www/3xui-acme /var/www/3xui-cover
@@ -607,7 +657,7 @@ EOF
         ufw allow 443/tcp
         ufw allow 8443/tcp
     fi
-    stage="issuing certificates"
+    begin_step 5 "Выпуск сертификатов Let's Encrypt"
     for domain in "$panel" "$cover"; do
         certbot certonly --non-interactive --agree-tos --keep-until-expiring --email "$email" \
             --webroot -w /var/www/3xui-acme --cert-name "$domain" -d "$domain"
@@ -617,10 +667,10 @@ EOF
     chmod 755 /etc/letsencrypt/renewal-hooks/deploy/3xui-nginx
     systemctl enable --now certbot.timer
 
-    stage='installing and starting 3x-ui'
+    begin_step 6 'Установка и запуск 3x-ui'
     diagnostic_service=x-ui
     install_panel
-    stage='configuring and checking HTTPS'
+    begin_step 7 'Настройка и проверка HTTPS'
     diagnostic_service=nginx
     managed_nginx "$state_dir/https.conf"
     nginx -t
@@ -628,7 +678,7 @@ EOF
     wait_for_http 'Panel HTTPS' "https://$panel/$base/" --resolve "$panel:443:127.0.0.1"
     wait_for_http 'Camouflage HTTPS' "https://$cover/" --resolve "$cover:443:127.0.0.1"
 
-    stage='configuring and checking Reality'
+    begin_step 8 'Настройка и проверка VLESS Reality'
     diagnostic_service=x-ui
     local xray keys link i
     xray=$(find /usr/local/x-ui/bin -maxdepth 1 -type f -name 'xray-linux-*' -print -quit)
@@ -653,10 +703,10 @@ EOF
         sleep 1
     done
     [[ -n "$(ss -H -ltn 'sport = :8443')" ]] || die 'Xray has not opened port 8443. Check journalctl -u x-ui.'
-    stage='starting Fail2ban'
+    begin_step 9 'Запуск Fail2ban'
     diagnostic_service=fail2ban
     systemctl enable --now fail2ban
-    stage='saving connection details'
+    begin_step 10 'Проверка API и сохранение реквизитов'
     diagnostic_service=x-ui
     local api_token
     ensure_node_token
@@ -664,7 +714,11 @@ EOF
     # shellcheck disable=SC2034 # Serialized indirectly through state_fields.
     completed=1
     save_state
-    cat "$result"
+    ui_line 32 "  [ OK ] $stage"
+    printf '\n'
+    ui_line 32 '  [ OK ] Установка NEW-NODE завершена'
+    print_details
+    ui_line 33 '  [ ! ] Не публикуйте пароль, API-токен и VLESS-ссылку.'
 
     rm -rf -- "$temp"
     trap - EXIT

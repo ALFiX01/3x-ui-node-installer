@@ -7,11 +7,92 @@ umask 077
 stage='preflight checks'
 diagnostic_service=''
 credentials_file=''
+state_fields=(panel cover email username password base private public short client_id
+    install_started install_done configured token_started inbound_done completed)
+
+# JSON is data, never sourced as shell code. Replace the state atomically.
+save_state() {
+    local name values=()
+    for name in "${state_fields[@]}"; do values+=("${!name}"); done
+    python3 - "$state_dir/state.json" "${values[@]}" <<'PY'
+import json, os, sys, tempfile
+path = sys.argv[1]
+names = 'panel cover email username password base private public short client_id install_started install_done configured token_started inbound_done completed'.split()
+data = dict(zip(names, sys.argv[2:]))
+data['version'] = 1
+fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path))
+try:
+    with os.fdopen(fd, 'w') as f:
+        json.dump(data, f)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+    if os.name == 'posix':
+        directory = os.open(os.path.dirname(path), os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+finally:
+    if os.path.exists(tmp):
+        os.unlink(tmp)
+PY
+}
+
+load_state() {
+    local serialized name index=0 values
+    serialized=$(python3 - "$state_dir/state.json" <<'PY'
+import json, re, sys, uuid
+d = json.load(open(sys.argv[1], encoding='utf-8'))
+def require(ok):
+    if not ok:
+        raise SystemExit('Invalid or unsupported installation state; no changes made.')
+names = 'panel cover email username password base private public short client_id install_started install_done configured token_started inbound_done completed'.split()
+require(d.get('version') == 1)
+require(all(isinstance(d.get(n), str) and not any(c in d[n] for c in '\n\r\0') for n in names))
+for n, size in [('username', 10), ('password', 24), ('base', 18)]:
+    require(re.fullmatch('[0-9a-f]{%d}' % size, d[n]) is not None)
+for n in names[10:]:
+    require(d[n] in ('0', '1'))
+require(d['install_done'] <= d['install_started'] and d['configured'] <= d['install_done'])
+require(d['completed'] <= d['inbound_done'] and d['completed'] <= d['token_started'])
+if any(d[n] for n in ('private', 'public', 'short', 'client_id')):
+    require(all(re.fullmatch('[A-Za-z0-9_-]{43}', d[n]) for n in ('private', 'public')))
+    require(re.fullmatch('[0-9a-f]{16}', d['short']) is not None)
+    require(str(uuid.UUID(d['client_id'])) == d['client_id'])
+require(d['inbound_done'] == '0' or bool(d['private']))
+print('\n'.join(d[n] for n in names))
+PY
+    )
+    mapfile -t values <<< "$serialized"
+    for name in "${state_fields[@]}"; do
+        printf -v "$name" '%s' "${values[index]}"
+        index=$((index + 1))
+    done
+    valid_domain "$panel" && valid_domain "$cover" && [[ "$panel" != "$cover" ]] \
+        || die 'Invalid domains in installation state.'
+}
+
+# Only the two configurations generated for this installation may be replaced.
+managed_nginx() {
+    local source=$1 target=${2:-/etc/nginx/sites-available/3xui-node} pending
+    [[ ! -L "$target" ]] || die 'Unexpected Nginx configuration symlink.'
+    if [[ -e "$target" ]]; then
+        cmp -s "$target" "$state_dir/bootstrap.conf" || cmp -s "$target" "$state_dir/https.conf" \
+            || die 'Nginx configuration changed outside the installer; inspect it before resuming.'
+    fi
+    pending=$(mktemp "${target}.XXXXXX")
+    install -m 644 "$source" "$pending"
+    mv -f -- "$pending" "$target"
+}
 on_error() {
     local status=$1 line=$2
     trap - ERR
     set +e
     printf 'Installation stopped at line %s during %s (exit %s). Existing changes were not rolled back.\n' "$line" "$stage" "$status" >&2
+    if [[ -n "${state_dir:-}" && -f "$state_dir/state.json" ]]; then
+        printf 'After resolving the error, run: bash install_3xui_node.sh --resume\n' >&2
+    fi
     if [[ -n "$credentials_file" && -f "$credentials_file" ]]; then
         printf 'Generated panel credentials are saved in %s (root only).\n' "$credentials_file" >&2
     fi
@@ -69,7 +150,7 @@ assert re.fullmatch(r'[0-9a-f]{16}', short)
 assert str(uuid.UUID(client_id)) == client_id
 settings = {'clients': [{'id': client_id, 'flow': 'xtls-rprx-vision',
     'email': 'node-client', 'enable': True, 'limitIp': 0, 'totalGB': 0,
-    'expiryTime': 0, 'subId': uuid.uuid4().hex[:16]}], 'decryption': 'none', 'fallbacks': []}
+    'expiryTime': 0, 'subId': uuid.UUID(client_id).hex[:16]}], 'decryption': 'none', 'fallbacks': []}
 stream = {'network': 'tcp', 'security': 'reality', 'tcpSettings': {'acceptProxyProtocol': False,
     'header': {'type': 'none'}}, 'realitySettings': {'show': False,
     'target': domain + ':443', 'xver': 0, 'serverNames': [domain],
@@ -144,19 +225,69 @@ shorts = r.get('shortIds', [])
 require(len(shorts) == 1 and re.fullmatch(r'[0-9a-f]{16}', shorts[0]) is not None, 'Unexpected Reality short IDs')
 with open(sys.argv[4], 'w') as output:
     json.dump({'private': private, 'short': shorts[0], 'client_id': client_id}, output)
+if len(sys.argv) > 5:
+    expected = json.load(open(sys.argv[5]))
+    es = obj(expected['streamSettings'])
+    er = es['realitySettings']
+    require(r.get('xver', 0) == er['xver'], 'Existing Reality xver differs from saved configuration')
+    settings = obj(x['settings'])
+    expected_settings = obj(expected['settings'])
+    require(settings.get('decryption') == expected_settings['decryption'] and
+            settings.get('fallbacks', []) == expected_settings['fallbacks'],
+            'Existing VLESS settings differ from saved configuration')
+    require(all(x.get(k) == expected[k] for k in ('total', 'expiryTime')), 'Existing inbound limits differ from saved configuration')
+    tcp = obj(stream.get('tcpSettings', {}))
+    require(tcp.get('acceptProxyProtocol') == es['tcpSettings']['acceptProxyProtocol'] and
+            obj(tcp.get('header', {})).get('type') == es['tcpSettings']['header']['type'],
+            'Existing TCP settings differ from saved configuration')
+    require(private == er['privateKey'], 'Existing Reality private key differs from saved key')
+    require(shorts == er['shortIds'], 'Existing Reality short IDs differ from saved identity')
+    require(x.get('listen') == expected['listen'], 'Existing inbound listen address changed')
+    ec = obj(expected['settings'])['clients'][0]
+    require(all(client.get(k) == ec[k] for k in ('id', 'flow', 'enable', 'subId', 'limitIp', 'totalGB', 'expiryTime')), 'Existing client differs from saved identity')
 PY
+}
+
+reconcile_inbound() {
+    local count
+    curl -fsS --noproxy '*' --max-time 15 -b "$temp/cookies" \
+        "http://127.0.0.1:4772/$base/panel/api/inbounds/list" > "$temp/list.json"
+    count=$(python3 - "$temp/list.json" <<'PY'
+import json, sys
+p = json.load(open(sys.argv[1]))
+if p.get('success') is not True or not isinstance(p.get('obj'), list):
+    raise SystemExit('Panel rejected inbound list request')
+print(sum(x.get('port') == 8443 for x in p['obj']))
+PY
+    )
+    if [[ "$count" == 0 ]]; then
+        [[ "$inbound_done" == 0 ]] || die 'Previously verified inbound is missing; refusing to recreate it.'
+        curl -fsS --noproxy '*' --max-time 20 -b "$temp/cookies" -c "$temp/cookies" \
+            -H "X-CSRF-Token: $csrf_token" -H 'Content-Type: application/json' \
+            --data-binary "@$state_dir/inbound.json" "http://127.0.0.1:4772/$base/panel/api/inbounds/add" > "$temp/add.json"
+        python3 -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1])).get("success") is True else "Panel rejected Reality inbound")' "$temp/add.json"
+        curl -fsS --noproxy '*' --max-time 15 -b "$temp/cookies" \
+            "http://127.0.0.1:4772/$base/panel/api/inbounds/list" > "$temp/list.json"
+    fi
+    read_inbound "$temp/list.json" "$cover" "$client_id" "$temp/verified.json" "$state_dir/inbound.json"
+    inbound_done=1
+    save_state
 }
 
 # Reuse the last saved plaintext token instead of rotating it on every report.
 ensure_node_token() {
-    api_token=$(awk '/^apiToken: / {sub(/^apiToken: /, ""); token=$0} END {print token}' "$result")
-    if [[ -z "$api_token" ]]; then
-        /usr/local/x-ui/x-ui setting -getApiToken > "$temp/api-token-output"
-        api_token=$(awk '/^apiToken: / {sub(/^apiToken: /, ""); token=$0} END {print token}' "$temp/api-token-output")
-        [[ -n "$api_token" && "$api_token" != *[[:space:]]* ]] || die 'Could not obtain API token. Panel credentials are still saved.'
-        # Preserve a new token immediately, even if validation/reporting fails.
-        printf '\napiToken: %s\n' "$api_token" >> "$result"
+    api_token=''
+    if [[ -f "$state_dir/api-token-output" ]]; then
+        api_token=$(awk '/^apiToken: / {sub(/^apiToken: /, ""); token=$0} END {print token}' "$state_dir/api-token-output")
     fi
+    if [[ -z "$api_token" ]]; then
+        [[ "$token_started" == 0 ]] || die 'Token creation was interrupted. Inspect API Tokens in the panel; refusing to rotate an unknown token.'
+        token_started=1
+        save_state
+        /usr/local/x-ui/x-ui setting -getApiToken > "$state_dir/api-token-output"
+        api_token=$(awk '/^apiToken: / {sub(/^apiToken: /, ""); token=$0} END {print token}' "$state_dir/api-token-output")
+    fi
+    [[ -n "$api_token" && "$api_token" != *[[:space:]]* ]] || die 'Could not obtain API token. Panel credentials are still saved.'
     if ! curl -fsS --noproxy '*' --connect-timeout 5 --max-time 15 \
         -H "Authorization: Bearer $api_token" \
         "http://127.0.0.1:4772/$base/panel/api/server/status" > "$temp/token-check.json"; then
@@ -199,31 +330,108 @@ save_details() {
     mv -f -- "$report_file" "$result"
 }
 
-main() {
+require_host() {
     [[ $EUID -eq 0 ]] || die 'Run as root: sudo bash install_3xui_node.sh'
+    # shellcheck source=/dev/null
     source /etc/os-release
     [[ "$ID" == ubuntu && ( "$VERSION_ID" == 22.04 || "$VERSION_ID" == 24.04 ) ]] || die 'Ubuntu 22.04 or 24.04 required.'
-    [[ ! -e /usr/local/x-ui && ! -e /etc/x-ui/x-ui.db ]] || die 'Existing 3x-ui found. This script only supports a fresh VPS.'
-    [[ ! -e /etc/nginx ]] || die 'Existing Nginx configuration found. Use a fresh VPS.'
     command -v systemctl >/dev/null || die 'systemd required.'
-    [[ ! -e /root/3xui-node-credentials.txt ]] || die 'Saved credentials already exist. Inspect the previous installation before continuing.'
-    printf 'Use two domains with DNS A records pointing directly to this VPS. Disable CDN proxy.\n'
-    local panel cover email
-    read -r -p 'Panel domain: ' panel
-    read -r -p 'Camouflage domain (Reality SNI/Target): ' cover
-    panel=${panel,,}; cover=${cover,,}
-    valid_domain "$panel" && valid_domain "$cover" || die 'Invalid domain. Use ASCII/punycode names without https:// or paths.'
-    [[ "$panel" != "$cover" ]] || die 'The two domains must differ.'
-    read -r -p "Email for Let's Encrypt: " email
-    [[ "$email" == *@*.* && "$email" != -* && "$email" != *[[:space:]]* ]] || die 'Invalid email.'
+}
+
+install_panel() {
+    if [[ "$install_done" == 0 ]]; then
+        [[ "$install_started" == 0 ]] || die 'Upstream installation was interrupted; inspect /usr/local/x-ui and journalctl -u x-ui. Automatic reinstallation is unsafe.'
+        [[ ! -e /usr/local/x-ui && ! -e /etc/x-ui/x-ui.db ]] || die 'Unexpected 3x-ui installation; refusing to overwrite it.'
+        curl -fsSL --retry 3 --connect-timeout 10 --max-time 180 \
+            https://raw.githubusercontent.com/MHSanaei/3x-ui/main/install.sh -o "$temp/install.sh"
+        bash -n "$temp/install.sh"
+        install_started=1
+        save_state
+        XUI_NONINTERACTIVE=1 XUI_DB_TYPE=sqlite XUI_SSL_MODE=none \
+            XUI_USERNAME="$username" XUI_PASSWORD="$password" XUI_WEB_BASE_PATH="$base" \
+            XUI_PANEL_PORT=4772 XUI_ENABLE_FAIL2BAN=true bash "$temp/install.sh"
+        install_done=1
+        save_state
+    fi
+    [[ -x /usr/local/x-ui/x-ui && -s /etc/x-ui/x-ui.db ]] || die 'Saved 3x-ui installation is missing or incomplete.'
+    if [[ "$configured" == 0 ]]; then
+        systemctl stop x-ui
+        /usr/local/x-ui/x-ui setting -username "$username" -password "$password" \
+            -port 4772 -webBasePath "/$base/" -listenIP 127.0.0.1
+        configured=1
+        save_state
+    fi
+    systemctl enable --now x-ui
+    wait_for_http '3x-ui on loopback' "http://127.0.0.1:4772/$base/"
+    ss -H -ltn 'sport = :4772' | grep -q '127.0.0.1:4772' || die 'Panel is not listening on loopback.'
+    [[ -z "$(ss -H -ltn 'sport = :4772' | grep -v '127.0.0.1:4772')" ]] || die 'Unexpected public panel listener.'
+}
+
+main() {
+    local resume=0
+    case "${1:-}" in
+        --resume) resume=1 ;;
+        --help|-h) printf 'Usage: bash install_3xui_node.sh [--resume]\n'; return 0 ;;
+        '') ;;
+        *) die 'Unknown argument. Usage: bash install_3xui_node.sh [--resume]' ;;
+    esac
+    [[ $# -le 1 ]] || die 'Too many arguments.'
+    require_host
+    # Prevent concurrent installers, including a fresh run racing --resume.
+    exec 9>/run/lock/3xui-node-install.lock
+    flock -n 9 || die 'Another node installation is running.'
+    state_dir=/root/.3xui-node-install
+    local result=/root/3xui-node-credentials.txt
+    local panel cover email username password base private='' public='' short='' client_id=''
+    local install_started=0 install_done=0 configured=0 token_started=0 inbound_done=0 completed=0
+    if [[ "$resume" == 1 ]]; then
+        [[ -d "$state_dir" && ! -L "$state_dir" ]] || die 'No resumable state. Legacy installations cannot be adopted automatically.'
+        [[ $(stat -c '%u:%a' "$state_dir") == 0:700 ]] || die 'Installation state directory must be owned by root with mode 700.'
+        [[ -f "$state_dir/state.json" && ! -L "$state_dir/state.json" ]] || die 'Missing or unsafe installation state file.'
+        [[ $(stat -c '%u:%a' "$state_dir/state.json") == 0:600 ]] || die 'Installation state file must be owned by root with mode 600.'
+        load_state
+        printf 'Resuming installation for %s and %s.\n' "$panel" "$cover"
+    else
+        [[ ! -e "$state_dir" && ! -L "$state_dir" ]] || die 'Installation state already exists. Use --resume.'
+        [[ ! -e /usr/local/x-ui && ! -e /etc/x-ui/x-ui.db ]] || die 'Existing 3x-ui found. This script only supports a fresh VPS.'
+        [[ ! -e /etc/nginx ]] || die 'Existing Nginx configuration found. Use a fresh VPS.'
+        [[ ! -e "$result" && ! -L "$result" ]] || die 'Saved credentials already exist. Inspect the previous installation before continuing.'
+        printf 'Use two domains with DNS A records pointing directly to this VPS. Disable CDN proxy.\n'
+        read -r -p 'Panel domain: ' panel
+        read -r -p 'Camouflage domain (Reality SNI/Target): ' cover
+        panel=${panel,,}; cover=${cover,,}
+        valid_domain "$panel" && valid_domain "$cover" || die 'Invalid domain. Use ASCII/punycode names without https:// or paths.'
+        [[ "$panel" != "$cover" ]] || die 'The two domains must differ.'
+        read -r -p "Email for Let's Encrypt: " email
+        [[ "$email" == *@*.* && "$email" != -* && "$email" != *[[:space:]]* ]] || die 'Invalid email.'
+    fi
     export DEBIAN_FRONTEND=noninteractive
     stage='installing prerequisites'
     apt-get update
-    apt-get install -y ca-certificates curl dnsutils openssl python3 jq iproute2
+    apt-get install -y ca-certificates curl dnsutils openssl python3 jq iproute2 util-linux
     local port
-    for port in 80 443 8443 4772; do
-        [[ -z "$(ss -H -ltn "sport = :$port")" ]] || die "TCP port $port is already in use."
-    done
+    if [[ "$resume" == 0 ]]; then
+        for port in 80 443 8443 4772; do
+            [[ -z "$(ss -H -ltn "sport = :$port")" ]] || die "TCP port $port is already in use."
+        done
+        username=$(openssl rand -hex 5)
+        password=$(openssl rand -hex 12)
+        base=$(openssl rand -hex 9)
+        mkdir -m 700 "$state_dir"
+        save_state
+    fi
+    # Global because EXIT cleanup may run after main has returned.
+    temp=$(mktemp -d)
+    trap 'rm -rf -- "$temp"' EXIT
+    [[ ! -L "$result" ]] || die 'Unexpected credentials file symlink.'
+    if [[ ! -e "$result" ]]; then
+        {
+            printf 'Panel: https://%s/%s/\nUsername: %s\nPassword: %s\n' "$panel" "$base" "$username" "$password"
+            printf 'Installation may be incomplete; use --resume after resolving the error.\n'
+        } > "$result"
+        chmod 600 "$result"
+    fi
+    credentials_file=$result
     stage='checking DNS'
     local ipv4 domain records address
     ipv4=$(curl -4fsS --retry 2 --connect-timeout 10 --max-time 20 https://api.ipify.org)
@@ -242,9 +450,127 @@ main() {
     diagnostic_service=nginx
     apt-get install -y nginx certbot fail2ban
     install -d -m 755 /var/www/3xui-acme /var/www/3xui-cover
-    printf '%s\n' '<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Welcome</title><h1>Welcome</h1><p>This website is online.</p></html>' > /var/www/3xui-cover/index.html
+    cat > /var/www/3xui-cover/index.html <<'COVER_HTML'
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Вход в личный кабинет</title>
+  <style>
+    :root { color-scheme: dark; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color: #ececf1; background: #0e0f12; }
+    * { box-sizing: border-box; }
+    [hidden] { display: none !important; }
+    body { margin: 0; min-width: 280px; min-height: 100vh; min-height: 100svh; display: flex; flex-direction: column; }
+    button, input { font: inherit; }
+    .site-header { padding: 28px 40px; display: flex; align-items: center; gap: 11px; }
+    .brand-mark { width: 32px; height: 32px; border-radius: 10px; background: #91cbb2; display: grid; place-items: center; color: #11271e; }
+    .brand-name { font-size: 15px; font-weight: 650; letter-spacing: -.3px; }
+    main { flex: 1; display: grid; place-items: center; padding: 32px 20px 64px; }
+    .card { width: 100%; max-width: 420px; padding: 38px; background: #191a20; border: 1px solid #30323c; border-radius: 20px; box-shadow: 0 12px 40px #00000033; }
+    .entry-icon { width: 48px; height: 48px; display: grid; place-items: center; border: 1px solid #30323c; border-radius: 14px; color: #91cbb2; margin-bottom: 26px; }
+    h1 { font-size: 30px; font-weight: 650; letter-spacing: -1px; line-height: 1.2; margin: 0 0 10px; }
+    .intro { color: #b0b2bf; font-size: 14px; line-height: 1.6; margin: 0 0 30px; }
+    .field { margin-bottom: 20px; }
+    label { display: block; font-size: 13px; font-weight: 600; margin-bottom: 9px; }
+    .input-wrap { position: relative; }
+    input { display: block; width: 100%; height: 48px; padding: 0 14px; color: #ececf1; background: #191a20; border: 1px solid #50535f; border-radius: 9px; outline: none; transition: border-color .15s, box-shadow .15s; }
+    input::placeholder { color: #a0a3b1; opacity: 1; }
+    input:focus { border-color: #91cbb2; box-shadow: 0 0 0 3px #91cbb226; }
+    input[aria-invalid="true"] { border-color: #ee998f; }
+    #password { padding-right: 52px; }
+    .show-password { position: absolute; right: 3px; top: 3px; width: 44px; height: 42px; display: grid; place-items: center; border: 0; background: transparent; border-radius: 6px; color: #b0b2bf; cursor: pointer; }
+    .show-password:hover { background: #0e0f12; color: #91cbb2; }
+    button:focus-visible { outline: 3px solid #91cbb2; outline-offset: 3px; }
+    .error { color: #ee998f; font-size: 13px; line-height: 1.5; margin: -4px 0 18px; }
+    .submit { width: 100%; min-height: 48px; display: flex; align-items: center; justify-content: center; gap: 12px; padding: 12px 18px; border: 1px solid #91cbb2; border-radius: 9px; color: #11271e; background: #91cbb2; font-weight: 600; font-size: 14px; cursor: pointer; transition: background .15s; }
+    .submit:hover { background: #a4d8c1; }
+    .submit:active { background: #7cb99f; }
+    .access-note { margin: 26px 0 0; padding-top: 23px; border-top: 1px solid #30323c; color: #a6a8b7; font-size: 12px; line-height: 1.6; text-align: center; }
+    footer { padding: 0 20px 26px; text-align: center; color: #a6a8b7; font-size: 12px; }
+    svg { display: block; flex-shrink: 0; }
+    @media (max-width: 480px) { .site-header { padding: 22px 24px; } main { padding: 20px 16px 40px; } .card { padding: 28px 24px; border-radius: 16px; } h1 { font-size: 28px; } }
+    @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+  </style>
+</head>
+<body>
+  <header class="site-header">
+    <span class="brand-mark" aria-hidden="true">
+      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M5 18V6h6a6 6 0 0 1 0 12H5Z"/><path d="M9 6v12"/></svg>
+    </span>
+    <span class="brand-name">Личный кабинет</span>
+  </header>
+  <main>
+    <section class="card" aria-labelledby="title">
+      <div class="entry-icon" aria-hidden="true">
+        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M14 4h4a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-4M4 12h11m-4-4 4 4-4 4"/></svg>
+      </div>
+      <h1 id="title">С возвращением</h1>
+      <p class="intro">Введите свои данные, чтобы войти<br>в личный кабинет.</p>
+      <form id="login-form" method="post">
+        <div class="field">
+          <label for="username">Логин</label>
+          <input id="username" type="text" placeholder="Введите логин" autocomplete="off" autocapitalize="none" spellcheck="false" required>
+        </div>
+        <div class="field">
+          <label for="password">Пароль</label>
+          <div class="input-wrap">
+            <input id="password" type="password" placeholder="Введите пароль" autocomplete="off" required>
+            <button class="show-password" id="show-password" type="button" aria-label="Показать пароль" aria-pressed="false" aria-controls="password" hidden>
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12Z"/><circle cx="12" cy="12" r="3"/></svg>
+            </button>
+          </div>
+        </div>
+        <p id="login-error" class="error" role="alert" hidden>Неверный логин или пароль. Проверьте данные и попробуйте снова.</p>
+        <button class="submit" id="submit" type="submit" disabled>
+          Войти
+          <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12h14m-5-5 5 5-5 5"/></svg>
+        </button>
+        <noscript><p class="error">Для входа включите JavaScript в браузере.</p></noscript>
+      </form>
+      <p class="access-note">Доступ только для пользователей<br>с существующей учётной записью.</p>
+    </section>
+  </main>
+  <footer>Личный кабинет · Доступ по приглашению</footer>
+  <script>
+    const form = document.getElementById('login-form');
+    const username = document.getElementById('username');
+    const password = document.getElementById('password');
+    const toggle = document.getElementById('show-password');
+    const error = document.getElementById('login-error');
+    // Cover page only: no authentication requests or credential storage.
+    form.addEventListener('submit', (event) => {
+      event.preventDefault();
+      error.hidden = false;
+      for (const input of [username, password]) {
+        input.setAttribute('aria-invalid', 'true');
+        input.setAttribute('aria-describedby', 'login-error');
+      }
+      password.value = '';
+      password.focus();
+    });
+    form.addEventListener('input', () => {
+      error.hidden = true;
+      for (const input of [username, password]) {
+        input.removeAttribute('aria-invalid');
+        input.removeAttribute('aria-describedby');
+      }
+    });
+    toggle.addEventListener('click', () => {
+      const visible = password.type === 'password';
+      password.type = visible ? 'text' : 'password';
+      toggle.setAttribute('aria-pressed', String(visible));
+      toggle.setAttribute('aria-label', visible ? 'Скрыть пароль' : 'Показать пароль');
+    });
+    toggle.hidden = false;
+    document.getElementById('submit').disabled = false;
+  </script>
+</body>
+</html>
+COVER_HTML
     chmod 644 /var/www/3xui-cover/index.html
-    cat > /etc/nginx/sites-available/3xui-node <<EOF
+    cat > "$temp/bootstrap.conf" <<EOF
 server {
     listen 80;
     server_name $panel $cover;
@@ -252,8 +578,27 @@ server {
     location / { return 404; }
 }
 EOF
-    chmod 644 /etc/nginx/sites-available/3xui-node
-    ln -s /etc/nginx/sites-available/3xui-node /etc/nginx/sites-enabled/3xui-node
+    # Templates below are generated from the persisted identity on every run.
+    render_https > "$temp/https.conf"
+    local template pending
+    for template in bootstrap.conf https.conf; do
+        if [[ -e "$state_dir/$template" ]]; then
+            cmp -s "$temp/$template" "$state_dir/$template" || die 'Saved Nginx template differs from installation state.'
+        else
+            pending=$(mktemp "$state_dir/${template}.XXXXXX")
+            install -m 600 "$temp/$template" "$pending"
+            mv -f -- "$pending" "$state_dir/$template"
+        fi
+    done
+    if [[ ! -e /etc/nginx/sites-available/3xui-node ]] || ! cmp -s /etc/nginx/sites-available/3xui-node "$state_dir/https.conf"; then
+        managed_nginx "$state_dir/bootstrap.conf"
+    fi
+    if [[ -L /etc/nginx/sites-enabled/3xui-node ]]; then
+        [[ $(readlink /etc/nginx/sites-enabled/3xui-node) == /etc/nginx/sites-available/3xui-node ]] || die 'Unexpected Nginx site link.'
+    else
+        [[ ! -e /etc/nginx/sites-enabled/3xui-node ]] || die 'Unexpected Nginx enabled site.'
+        ln -s /etc/nginx/sites-available/3xui-node /etc/nginx/sites-enabled/3xui-node
+    fi
     nginx -t
     systemctl enable --now nginx
     systemctl reload nginx
@@ -264,7 +609,7 @@ EOF
     fi
     stage="issuing certificates"
     for domain in "$panel" "$cover"; do
-        certbot certonly --non-interactive --agree-tos --email "$email" \
+        certbot certonly --non-interactive --agree-tos --keep-until-expiring --email "$email" \
             --webroot -w /var/www/3xui-acme --cert-name "$domain" -d "$domain"
     done
     install -d -m 755 /etc/letsencrypt/renewal-hooks/deploy
@@ -272,40 +617,61 @@ EOF
     chmod 755 /etc/letsencrypt/renewal-hooks/deploy/3xui-nginx
     systemctl enable --now certbot.timer
 
-    local username password base
-    # Global because EXIT cleanup can run after main has returned on an error.
-    temp=$(mktemp -d)
-    trap 'rm -rf -- "$temp"' EXIT
-    username=$(openssl rand -hex 5)
-    password=$(openssl rand -hex 12)
-    base=$(openssl rand -hex 9)
-    local result=/root/3xui-node-credentials.txt
-    # Preserve the intended login before the installer or later checks can fail.
-    {
-        printf 'Panel: https://%s/%s/\nUsername: %s\nPassword: %s\n' "$panel" "$base" "$username" "$password"
-        printf 'Installation may be incomplete; use these credentials after the panel is configured.\n'
-    } > "$result"
-    chmod 600 "$result"
-    credentials_file=$result
     stage='installing and starting 3x-ui'
     diagnostic_service=x-ui
-    # Fetch to a file and check syntax before executing; do not pipe network data to bash.
-    curl -fsSL --retry 3 --connect-timeout 10 --max-time 180 \
-        https://raw.githubusercontent.com/MHSanaei/3x-ui/master/install.sh -o "$temp/install.sh"
-    bash -n "$temp/install.sh"
-    XUI_NONINTERACTIVE=1 XUI_DB_TYPE=sqlite XUI_SSL_MODE=none \
-        XUI_USERNAME="$username" XUI_PASSWORD="$password" XUI_WEB_BASE_PATH="$base" \
-        XUI_PANEL_PORT=4772 XUI_ENABLE_FAIL2BAN=true bash "$temp/install.sh"
-    systemctl stop x-ui
-    /usr/local/x-ui/x-ui setting -username "$username" -password "$password" \
-        -port 4772 -webBasePath "/$base/" -listenIP 127.0.0.1
-    systemctl enable --now x-ui
-    wait_for_http '3x-ui on loopback' "http://127.0.0.1:4772/$base/"
-    ss -H -ltn 'sport = :4772' | grep -q '127.0.0.1:4772' || die 'Panel is not listening on loopback.'
-    [[ -z "$(ss -H -ltn 'sport = :4772' | grep -v '127.0.0.1:4772')" ]] || die 'Unexpected public panel listener.'
+    install_panel
     stage='configuring and checking HTTPS'
     diagnostic_service=nginx
-    cat > /etc/nginx/sites-available/3xui-node <<EOF
+    managed_nginx "$state_dir/https.conf"
+    nginx -t
+    systemctl reload nginx
+    wait_for_http 'Panel HTTPS' "https://$panel/$base/" --resolve "$panel:443:127.0.0.1"
+    wait_for_http 'Camouflage HTTPS' "https://$cover/" --resolve "$cover:443:127.0.0.1"
+
+    stage='configuring and checking Reality'
+    diagnostic_service=x-ui
+    local xray keys link i
+    xray=$(find /usr/local/x-ui/bin -maxdepth 1 -type f -name 'xray-linux-*' -print -quit)
+    [[ -n "$xray" && -x "$xray" ]] || die 'Xray binary not found.'
+    if [[ -z "$private" ]]; then
+        keys=$("$xray" x25519)
+        private=$(printf '%s\n' "$keys" | awk -F': *' '/^Private[Kk]ey:|^Private key:/ {print $2}')
+        public=$(printf '%s\n' "$keys" | awk -F': *' '/^Public[Kk]ey:|^Public key:|^Password( \(PublicKey\))?:/ {print $2}')
+        short=$(openssl rand -hex 8)
+        client_id=$(cat /proc/sys/kernel/random/uuid)
+        # Validate all generated values before saving any identity or calling the API.
+        make_payload "$cover" "$private" "$public" "$short" "$client_id" "$temp/inbound.json" >/dev/null
+        save_state
+    fi
+    link=$(make_payload "$cover" "$private" "$public" "$short" "$client_id" "$temp/inbound.json")
+    mv -f -- "$temp/inbound.json" "$state_dir/inbound.json"
+    panel_login "http://127.0.0.1:4772/$base" "$username" "$password" "$temp/cookies" > "$temp/login.json"
+    jq -e '.success == true' "$temp/login.json" >/dev/null || die 'Panel login failed.'
+    reconcile_inbound
+    for ((i=0; i<20; i++)); do
+        if [[ -n "$(ss -H -ltn 'sport = :8443')" ]]; then break; fi
+        sleep 1
+    done
+    [[ -n "$(ss -H -ltn 'sport = :8443')" ]] || die 'Xray has not opened port 8443. Check journalctl -u x-ui.'
+    stage='starting Fail2ban'
+    diagnostic_service=fail2ban
+    systemctl enable --now fail2ban
+    stage='saving connection details'
+    diagnostic_service=x-ui
+    local api_token
+    ensure_node_token
+    save_details
+    # shellcheck disable=SC2034 # Serialized indirectly through state_fields.
+    completed=1
+    save_state
+    cat "$result"
+
+    rm -rf -- "$temp"
+    trap - EXIT
+}
+
+render_https() {
+    cat <<EOF
 server {
     listen 80;
     server_name $panel $cover;
@@ -341,48 +707,6 @@ server {
     index index.html;
 }
 EOF
-    nginx -t
-    systemctl reload nginx
-    wait_for_http 'Panel HTTPS' "https://$panel/$base/" --resolve "$panel:443:127.0.0.1"
-    wait_for_http 'Camouflage HTTPS' "https://$cover/" --resolve "$cover:443:127.0.0.1"
-
-    stage='configuring and checking Reality'
-    diagnostic_service=x-ui
-    local xray keys private public short client_id link i
-    xray=$(find /usr/local/x-ui/bin -maxdepth 1 -type f -name 'xray-linux-*' -print -quit)
-    [[ -n "$xray" && -x "$xray" ]] || die 'Xray binary not found.'
-    keys=$("$xray" x25519)
-    private=$(printf '%s\n' "$keys" | awk -F': *' '/^Private[Kk]ey:|^Private key:/ {print $2}')
-    public=$(printf '%s\n' "$keys" | awk -F': *' '/^Public[Kk]ey:|^Public key:|^Password( \(PublicKey\))?:/ {print $2}')
-    short=$(openssl rand -hex 8)
-    client_id=$(cat /proc/sys/kernel/random/uuid)
-    link=$(make_payload "$cover" "$private" "$public" "$short" "$client_id" "$temp/inbound.json")
-    panel_login "http://127.0.0.1:4772/$base" "$username" "$password" "$temp/cookies" > "$temp/login.json"
-    jq -e '.success == true' "$temp/login.json" >/dev/null || die 'Panel login failed.'
-    curl -fsS --noproxy '*' --max-time 20 -b "$temp/cookies" -c "$temp/cookies" \
-        -H "X-CSRF-Token: $csrf_token" -H 'Content-Type: application/json' \
-        --data-binary "@$temp/inbound.json" "http://127.0.0.1:4772/$base/panel/api/inbounds/add" > "$temp/add.json"
-    jq -e '.success == true' "$temp/add.json" >/dev/null || die 'Panel rejected Reality inbound.'
-    curl -fsS --noproxy '*' --max-time 15 -b "$temp/cookies" \
-        "http://127.0.0.1:4772/$base/panel/api/inbounds/list" > "$temp/list.json"
-    read_inbound "$temp/list.json" "$cover" "$client_id" "$temp/verified.json"
-    for i in {1..20}; do
-        if [[ -n "$(ss -H -ltn 'sport = :8443')" ]]; then break; fi
-        sleep 1
-    done
-    [[ -n "$(ss -H -ltn 'sport = :8443')" ]] || die 'Xray has not opened port 8443. Check journalctl -u x-ui.'
-    stage='starting Fail2ban'
-    diagnostic_service=fail2ban
-    systemctl enable --now fail2ban
-    stage='saving connection details'
-    diagnostic_service=x-ui
-    local api_token
-    ensure_node_token
-    save_details
-    cat "$result"
-
-    rm -rf -- "$temp"
-    trap - EXIT
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then main "$@"; fi

@@ -1,0 +1,28 @@
+name: Installer checks
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  offline-checks:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install ShellCheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - name: Check Bash syntax
+        run: bash -n install_3xui_node.sh
+      - name: Check shell code
+        run: shellcheck --severity=warning install_3xui_node.sh
+      - name: Run offline unit and recovery integration tests
+        run: python3 -m unittest discover -s tests -v
